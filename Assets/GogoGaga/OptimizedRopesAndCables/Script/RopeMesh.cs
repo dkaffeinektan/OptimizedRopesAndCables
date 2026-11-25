@@ -9,7 +9,7 @@ namespace GogoGaga.OptimizedRopesAndCables
     [RequireComponent(typeof(MeshFilter)), RequireComponent(typeof(MeshRenderer)), RequireComponent(typeof(Rope))]
     public class RopeMesh : MonoBehaviour
     {
-        [Range(3, 25)] public int OverallDivision = 6;
+        [Range(3, 100)] public int OverallDivision = 6;
         [Range(0.01f, 10)] public float ropeWidth = 0.3f;
         [Range(3, 20)] public int radialDivision = 8;
         [Tooltip("For now only base color is applied")]
@@ -261,17 +261,6 @@ namespace GogoGaga.OptimizedRopesAndCables
                 points[i] = rope.GetPointAt(i / (float)OverallDivision);
             }
             CreateRopeMesh(points, ropeWidth, radialDivision);
-        }
-
-        void Update()
-        {
-            if (rope.IsPrefab)
-                return;
-
-            if (Application.isPlaying)
-            {
-                GenerateMesh();
-            }
         }
 
         private void DelayedGenerateMesh()

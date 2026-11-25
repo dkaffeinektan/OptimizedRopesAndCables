@@ -1,11 +1,16 @@
 using UnityEngine;
 using System;
-#if UNITY_EDITOR
-using UnityEditor;
-#endif
+using Unity.Entities;
+using Unity.Physics;
+using Unity.Physics.Authoring;
 
 namespace GogoGaga.OptimizedRopesAndCables
 {
+    /// <summary>
+    /// GameObject side of a rope. In play mode it owns an entity simulated by <see cref="RopeSimulationSystem"/>
+    /// (Verlet particles colliding with Unity Physics colliders) and renders the particles it reads back.
+    /// In edit mode it only shows the initial hanging shape, since no physics world runs there.
+    /// </summary>
     [ExecuteAlways]
     [RequireComponent(typeof(LineRenderer))]
     public class Rope : MonoBehaviour
@@ -26,11 +31,14 @@ namespace GogoGaga.OptimizedRopesAndCables
         public Transform EndPoint => endPoint;
 
         [Header("Rope Settings")]
-        [Tooltip("How many points should the rope have, 2 would be a triangle with straight lines, 100 would be a very flexible rope with many parts")]
+        [Tooltip("How many segments the rope has, 2 would be a triangle with straight lines, 100 would be a very flexible rope with many parts")]
         [Range(2, 100)] public int linePoints = 10;
 
-        [Tooltip("Value highly dependent on use case, a metal cable would have high stiffness, a rubber rope would have a low one")]
-        public float stiffness = 350f;
+        [Tooltip("Rendered points per rope segment. The rope is drawn as a smooth curve through the simulated points, so higher values look rounder at no simulation cost")]
+        [Range(1, 16)] public int smoothingSubdivisions = 4;
+
+        [Tooltip("How many times per physics step segment lengths and collisions are solved. Higher values stretch less and pass through colliders less, at a higher cost")]
+        [Range(1, 50)] public int constraintIterations = 20;
 
         [Tooltip("0 is no damping, 50 is a lot")]
         public float damping = 15f;
@@ -38,52 +46,47 @@ namespace GogoGaga.OptimizedRopesAndCables
         [Tooltip("How long is the rope, it will hang more or less from starting point to end point depending on this value")]
         public float ropeLength = 15;
 
-        [Tooltip("The Rope width set at start (changing this value during run time will produce no effect)")]
+        [Tooltip("The Rope width. Half of it is the collision radius of the rope")]
         public float ropeWidth = 0.1f;
 
-        [Header("Rational Bezier Weight Control")]
-        [Tooltip("Adjust the middle control point weight for the Rational Bezier curve")]
-        [Range(1, 15)] public float midPointWeight = 1f;
-        private const float StartPointWeight = 1f; //these need to stay at 1, could be removed but makes calling the rational bezier function easier to read and understand
-        private const float EndPointWeight = 1f;
+        [Header("Collision")]
+        [Tooltip("Unity Physics categories the rope belongs to")]
+        public PhysicsCategoryTags belongsTo = new PhysicsCategoryTags { Category01 = true };
+
+        [Tooltip("Unity Physics categories of the colliders the rope collides with")]
+        public PhysicsCategoryTags collidesWith = new PhysicsCategoryTags { Category00 = true };
 
         [Header("Midpoint Position")]
-        [Tooltip("Position of the midpoint along the line between start and end points")]
+        [Tooltip("Position of the Mid Point transform along the rope")]
         [Range(0.25f, 0.75f)] public float midPointPosition = 0.5f;
 
-        private Vector3 currentValue;
-        private Vector3 currentVelocity;
-        private Vector3 targetValue;
+        /// <summary>
+        /// Velocity change applied to the rope every <see cref="Time.fixedDeltaTime"/> step, wind for example.
+        /// </summary>
         public Vector3 otherPhysicsFactors { get; set; }
-        private const float valueThreshold = 0.01f;
-        private const float velocityThreshold = 0.01f;
 
+        private Vector3[] particlePositions = new Vector3[0];
+        private Vector3[] renderedPositions = new Vector3[0];
         private LineRenderer lineRenderer;
-        private bool isFirstFrame = true;
+        private Entity ropeEntity = Entity.Null;
 
         private Vector3 prevStartPointPosition;
         private Vector3 prevEndPointPosition;
         private float prevMidPointPosition;
-        private float prevMidPointWeight;
 
         private float prevLineQuality;
         private float prevRopeWidth;
-        private float prevstiffness;
-        private float prevDampness;
         private float prevRopeLength;
-        
-        
+
+
         public bool IsPrefab => gameObject.scene.rootCount == 0;
-        
+
         private void Start()
         {
             InitializeLineRenderer();
             if (AreEndPointsValid())
             {
-                currentValue = GetMidPoint();
-                targetValue = currentValue;
-                currentVelocity = Vector3.zero;
-                SetSplinePoint(); // Ensure initial spline point is set correctly
+                RecalculateRope();
             }
         }
 
@@ -95,13 +98,17 @@ namespace GogoGaga.OptimizedRopesAndCables
                 if (AreEndPointsValid())
                 {
                     RecalculateRope();
-                    SimulatePhysics();
                 }
                 else
                 {
                     lineRenderer.positionCount = 0;
                 }
             }
+        }
+
+        private void OnDisable()
+        {
+            DestroyRopeEntity();
         }
 
         private void InitializeLineRenderer()
@@ -121,28 +128,48 @@ namespace GogoGaga.OptimizedRopesAndCables
             {
                 return;
             }
-            
+
             if (AreEndPointsValid())
             {
-                SetSplinePoint();
-
-                if (!Application.isPlaying && (IsPointsMoved() || IsRopeSettingsChanged()))
+                if (Application.isPlaying)
                 {
-                    SimulatePhysics();
+                    if (particlePositions.Length != linePoints + 1 || !HasRopeEntity())
+                    {
+                        RecalculateRope();
+                    }
+
+                    WriteSimulationInput();
+                }
+                else if (IsPointsMoved() || IsRopeSettingsChanged())
+                {
+                    RecalculateRope();
                     NotifyPointsChanged();
                 }
 
                 prevStartPointPosition = startPoint.position;
                 prevEndPointPosition = endPoint.position;
                 prevMidPointPosition = midPointPosition;
-                prevMidPointWeight = midPointWeight;
 
                 prevLineQuality = linePoints;
                 prevRopeWidth = ropeWidth;
-                prevstiffness = stiffness;
-                prevDampness = damping;
                 prevRopeLength = ropeLength;
             }
+        }
+
+        /// <summary>
+        /// Reads the particles in LateUpdate because the ECS simulation group runs at the end of the Update phase,
+        /// after every MonoBehaviour Update.
+        /// </summary>
+        private void LateUpdate()
+        {
+            if (IsPrefab || !Application.isPlaying || !AreEndPointsValid() || !HasRopeEntity())
+            {
+                return;
+            }
+
+            ReadSimulationOutput();
+            ApplyParticlePositions();
+            NotifyPointsChanged();
         }
 
         private bool AreEndPointsValid()
@@ -150,62 +177,53 @@ namespace GogoGaga.OptimizedRopesAndCables
             return startPoint != null && endPoint != null;
         }
 
-        private void SetSplinePoint()
+        /// <summary>
+        /// Lays the particles on a quadratic Bezier sagging by the rope length in excess of the end point distance.
+        /// This is the edit mode shape and the starting shape of the simulation.
+        /// </summary>
+        private void LayOutParticles()
         {
-            if (lineRenderer.positionCount != linePoints + 1)
+            if (particlePositions.Length != linePoints + 1)
             {
-                lineRenderer.positionCount = linePoints + 1;
+                particlePositions = new Vector3[linePoints + 1];
             }
 
-            Vector3 mid = GetMidPoint();
-            targetValue = mid;
-            mid = currentValue;
+            Vector3 start = startPoint.position;
+            Vector3 end = endPoint.position;
+            Vector3 control = Vector3.Lerp(start, end, 0.5f);
+            control.y -= ropeLength - Mathf.Min(Vector3.Distance(start, end), ropeLength);
+
+            for (int i = 0; i <= linePoints; i++)
+            {
+                float t = i / (float)linePoints;
+                particlePositions[i] = (1 - t) * (1 - t) * start + 2 * (1 - t) * t * control + t * t * end;
+            }
+        }
+
+        private void ApplyParticlePositions()
+        {
+            int renderedCount = (particlePositions.Length - 1) * smoothingSubdivisions + 1;
+            if (renderedPositions.Length != renderedCount)
+            {
+                renderedPositions = new Vector3[renderedCount];
+            }
+
+            for (int i = 0; i < renderedCount; i++)
+            {
+                renderedPositions[i] = GetPointAt(i / (float)(renderedCount - 1));
+            }
+
+            if (lineRenderer.positionCount != renderedCount)
+            {
+                lineRenderer.positionCount = renderedCount;
+            }
+
+            lineRenderer.SetPositions(renderedPositions);
 
             if (midPoint != null)
             {
-                midPoint.position = GetRationalBezierPoint(startPoint.position, mid, endPoint.position, midPointPosition, StartPointWeight, midPointWeight, EndPointWeight);
+                midPoint.position = GetPointAt(midPointPosition);
             }
-
-            for (int i = 0; i < linePoints; i++)
-            {
-                Vector3 p = GetRationalBezierPoint(startPoint.position, mid, endPoint.position, i / (float)linePoints, StartPointWeight, midPointWeight, EndPointWeight);
-                lineRenderer.SetPosition(i, p);
-            }
-
-            lineRenderer.SetPosition(linePoints, endPoint.position);
-        }
-
-        private float CalculateYFactorAdjustment(float weight)
-        {
-            //float k = 0.360f; //after testing this seemed to be a good value for most cases, more accurate k is available.
-            float k = Mathf.Lerp(0.493f, 0.323f, Mathf.InverseLerp(1, 15, weight)); //K calculation that is more accurate, interpolates between precalculated values.
-            float w = 1f + k * Mathf.Log(weight);
-            return w;
-        }
-
-        private Vector3 GetMidPoint()
-        {
-            Vector3 startPointPosition = startPoint.position;
-            Vector3 endPointPosition = endPoint.position;
-            Vector3 midpos = Vector3.Lerp(startPointPosition, endPointPosition, midPointPosition);
-            float yFactor = (ropeLength - Mathf.Min(Vector3.Distance(startPointPosition, endPointPosition), ropeLength)) / CalculateYFactorAdjustment(midPointWeight);
-            midpos.y -= yFactor;
-            return midpos;
-        }
-
-        private Vector3 GetRationalBezierPoint(Vector3 p0, Vector3 p1, Vector3 p2, float t, float w0, float w1, float w2)
-        {
-            //scale each point by its weight (can probably remove w0 and w2 if the midpoint is the only adjustable weight)
-            Vector3 wp0 = w0 * p0;
-            Vector3 wp1 = w1 * p1;
-            Vector3 wp2 = w2 * p2;
-
-            //calculate the denominator of the rational Bézier curve
-            float denominator = w0 * Mathf.Pow(1 - t, 2) + 2 * w1 * (1 - t) * t + w2 * Mathf.Pow(t, 2);
-            //calculate the numerator and devide by the demoninator to get the point on the curve
-            Vector3 point = (wp0 * Mathf.Pow(1 - t, 2) + wp1 * 2 * (1 - t) * t + wp2 * Mathf.Pow(t, 2)) / denominator;
-
-            return point;
         }
 
         public Vector3 GetPointAt(float t)
@@ -216,54 +234,138 @@ namespace GogoGaga.OptimizedRopesAndCables
                 return Vector3.zero;
             }
 
-            return GetRationalBezierPoint(startPoint.position, currentValue, endPoint.position, t, StartPointWeight, midPointWeight, EndPointWeight);
+            if (particlePositions.Length < 2)
+            {
+                return Vector3.Lerp(startPoint.position, endPoint.position, t);
+            }
+
+            float scaledT = Mathf.Clamp01(t) * (particlePositions.Length - 1);
+            int index = Mathf.Min((int)scaledT, particlePositions.Length - 2);
+            return EvaluateCatmullRom(index, scaledT - index);
         }
 
-        private void FixedUpdate()
+        /// <summary>
+        /// Uniform Catmull-Rom curve between particles <paramref name="index"/> and <paramref name="index"/> + 1, so the
+        /// rope passes through every simulated particle without corners. Uniform is enough because the length
+        /// constraint keeps segments close to equal. Neighbours past the ends are mirrored so the ends keep the
+        /// direction of their segment.
+        /// </summary>
+        private Vector3 EvaluateCatmullRom(int index, float u)
         {
-            if (IsPrefab)
+            Vector3 p1 = particlePositions[index];
+            Vector3 p2 = particlePositions[index + 1];
+            Vector3 p0 = index > 0 ? particlePositions[index - 1] : 2f * p1 - p2;
+            Vector3 p3 = index + 2 < particlePositions.Length ? particlePositions[index + 2] : 2f * p2 - p1;
+
+            float u2 = u * u;
+            float u3 = u2 * u;
+            return 0.5f * (2f * p1
+                           + (p2 - p0) * u
+                           + (2f * p0 - 5f * p1 + 4f * p2 - p3) * u2
+                           + (3f * p1 - p0 - 3f * p2 + p3) * u3);
+        }
+
+        private static bool TryGetEntityManager(out EntityManager entityManager)
+        {
+            World world = World.DefaultGameObjectInjectionWorld;
+            bool isWorldValid = world != null && world.IsCreated;
+            entityManager = isWorldValid ? world.EntityManager : default;
+            return isWorldValid;
+        }
+
+        private bool HasRopeEntity()
+        {
+            return ropeEntity != Entity.Null && TryGetEntityManager(out EntityManager entityManager) && entityManager.Exists(ropeEntity);
+        }
+
+        /// <summary>
+        /// Restarts the simulation from <see cref="particlePositions"/>, creating the rope entity if needed.
+        /// </summary>
+        private void ResetRopeEntity()
+        {
+            if (!Application.isPlaying || IsPrefab || !TryGetEntityManager(out EntityManager entityManager))
             {
                 return;
             }
-            
-            if (AreEndPointsValid())
+
+            if (!HasRopeEntity())
             {
-                if (!isFirstFrame)
+                ropeEntity = entityManager.CreateEntity(typeof(RopeSimulationSettings), typeof(RopeAnchors), typeof(RopeParticle));
+            }
+
+            DynamicBuffer<RopeParticle> particles = entityManager.GetBuffer<RopeParticle>(ropeEntity);
+            particles.ResizeUninitialized(particlePositions.Length);
+            for (int i = 0; i < particlePositions.Length; i++)
+            {
+                particles[i] = new RopeParticle { Position = particlePositions[i], PreviousPosition = particlePositions[i] };
+            }
+
+            WriteSimulationInput();
+        }
+
+        private void DestroyRopeEntity()
+        {
+            if (HasRopeEntity() && TryGetEntityManager(out EntityManager entityManager))
+            {
+                entityManager.DestroyEntity(ropeEntity);
+            }
+
+            ropeEntity = Entity.Null;
+        }
+
+        /// <summary>
+        /// Converts <see cref="otherPhysicsFactors"/> to an acceleration because the ECS fixed step does not use
+        /// <see cref="Time.fixedDeltaTime"/>.
+        /// </summary>
+        private void WriteSimulationInput()
+        {
+            if (!HasRopeEntity() || !TryGetEntityManager(out EntityManager entityManager))
+            {
+                return;
+            }
+
+            entityManager.SetComponentData(ropeEntity, new RopeSimulationSettings
+            {
+                SegmentLength = ropeLength / linePoints,
+                Radius = ropeWidth * 0.5f,
+                Damping = damping,
+                ConstraintIterations = constraintIterations,
+                Filter = new CollisionFilter
                 {
-                    SimulatePhysics();
-                }
+                    BelongsTo = belongsTo.Value,
+                    CollidesWith = collidesWith.Value,
+                },
+            });
 
-                isFirstFrame = false;
-            }
-        }
-
-        private void SimulatePhysics()
-        {
-            float dampingFactor = Mathf.Max(0, 1 - damping * Time.fixedDeltaTime);
-            Vector3 acceleration = (targetValue - currentValue) * stiffness * Time.fixedDeltaTime;
-            currentVelocity = currentVelocity * dampingFactor + acceleration + otherPhysicsFactors;
-            currentValue += currentVelocity * Time.fixedDeltaTime;
-
-            if (Vector3.Distance(currentValue, targetValue) < valueThreshold && currentVelocity.magnitude < velocityThreshold)
+            entityManager.SetComponentData(ropeEntity, new RopeAnchors
             {
-                currentValue = targetValue;
-                currentVelocity = Vector3.zero;
-            }
+                Start = startPoint.position,
+                End = endPoint.position,
+                ExternalAcceleration = otherPhysicsFactors / Time.fixedDeltaTime,
+            });
         }
 
-        private void OnDrawGizmos()
+        private void ReadSimulationOutput()
         {
-            if (!AreEndPointsValid())
+            if (!TryGetEntityManager(out EntityManager entityManager))
+            {
                 return;
+            }
 
-            Vector3 midPos = GetMidPoint();
-            // Uncomment if you need to visualize midpoint
-            // Gizmos.color = Color.red;
-            // Gizmos.DrawSphere(midPos, 0.2f);
+            DynamicBuffer<RopeParticle> particles = entityManager.GetBuffer<RopeParticle>(ropeEntity, true);
+            if (particles.Length != particlePositions.Length)
+            {
+                return;
+            }
+
+            for (int i = 0; i < particles.Length; i++)
+            {
+                particlePositions[i] = particles[i].Position;
+            }
         }
 
         // New API methods for setting start and end points
-        // with instantAssign parameter to recalculate the rope immediately, without 
+        // with instantAssign parameter to recalculate the rope immediately, without
         // animating the rope to the new position.
         // When newStartPoint or newEndPoint is null, the rope will be recalculated immediately
 
@@ -283,14 +385,14 @@ namespace GogoGaga.OptimizedRopesAndCables
         {
             midPoint = newMidPoint;
             prevMidPointPosition = midPoint == null ? 0.5f : midPointPosition;
-            
+
             if (instantAssign || newMidPoint == null)
             {
                 RecalculateRope();
             }
             NotifyPointsChanged();
         }
-        
+
         public void SetEndPoint(Transform newEndPoint, bool instantAssign = false)
         {
             endPoint = newEndPoint;
@@ -312,10 +414,9 @@ namespace GogoGaga.OptimizedRopesAndCables
                 return;
             }
 
-            currentValue = GetMidPoint();
-            targetValue = currentValue;
-            currentVelocity = Vector3.zero;
-            SetSplinePoint();
+            LayOutParticles();
+            ResetRopeEntity();
+            ApplyParticlePositions();
         }
 
         private void NotifyPointsChanged()
@@ -334,19 +435,13 @@ namespace GogoGaga.OptimizedRopesAndCables
         {
             var lineQualityChanged = !Mathf.Approximately(linePoints, prevLineQuality);
             var ropeWidthChanged = !Mathf.Approximately(ropeWidth, prevRopeWidth);
-            var stiffnessChanged = !Mathf.Approximately(stiffness, prevstiffness);
-            var dampnessChanged = !Mathf.Approximately(damping, prevDampness);
             var ropeLengthChanged = !Mathf.Approximately(ropeLength, prevRopeLength);
             var midPointPositionChanged = !Mathf.Approximately(midPointPosition, prevMidPointPosition);
-            var midPointWeightChanged = !Mathf.Approximately(midPointWeight, prevMidPointWeight);
 
             return lineQualityChanged
                    || ropeWidthChanged
-                   || stiffnessChanged
-                   || dampnessChanged
                    || ropeLengthChanged
-                   || midPointPositionChanged
-                   || midPointWeightChanged;
+                   || midPointPositionChanged;
         }
     }
 }

@@ -12,11 +12,12 @@ namespace GogoGaga.OptimizedRopesAndCables
         private SerializedProperty endPoint;
         private SerializedProperty linePoints;
         private SerializedProperty ropeWidth;
-        private SerializedProperty stiffness;
+        private SerializedProperty constraintIterations;
         private SerializedProperty damping;
         private SerializedProperty ropeLength;
         private SerializedProperty midPointPosition;
-        private SerializedProperty midPointWeight;
+        private SerializedProperty belongsTo;
+        private SerializedProperty collidesWith;
 
         private void OnEnable()
         {
@@ -26,11 +27,12 @@ namespace GogoGaga.OptimizedRopesAndCables
             endPoint = serializedObject.FindProperty("endPoint");
             linePoints = serializedObject.FindProperty(nameof(Rope.linePoints));
             ropeWidth = serializedObject.FindProperty(nameof(Rope.ropeWidth));
-            stiffness = serializedObject.FindProperty(nameof(Rope.stiffness));
+            constraintIterations = serializedObject.FindProperty(nameof(Rope.constraintIterations));
             damping = serializedObject.FindProperty(nameof(Rope.damping));
             ropeLength = serializedObject.FindProperty(nameof(Rope.ropeLength));
             midPointPosition = serializedObject.FindProperty(nameof(Rope.midPointPosition));
-            midPointWeight = serializedObject.FindProperty(nameof(Rope.midPointWeight));
+            belongsTo = serializedObject.FindProperty(nameof(Rope.belongsTo));
+            collidesWith = serializedObject.FindProperty(nameof(Rope.collidesWith));
         }
 
         public override void OnInspectorGUI()
@@ -40,6 +42,7 @@ namespace GogoGaga.OptimizedRopesAndCables
             Label();
             RopeTransforms();
             RopeProperties();
+            RopeCollision();
             RopeCurve();
 
             if (GUILayout.Button("Add Mesh"))
@@ -139,14 +142,27 @@ namespace GogoGaga.OptimizedRopesAndCables
             EditorGUILayout.PropertyField(ropeWidth, new GUIContent("Rope Width", "The Rope width set at start (changing this value during run time will produce no effect)"));
             component.ropeWidth = component.ropeWidth < 0.001f ? 0.001f : component.ropeWidth;
 
-            EditorGUILayout.PropertyField(stiffness, new GUIContent("Rope Stiffness", "Value highly dependent on use case, a metal cable would have high stiffness, a rubber rope would have a low one"));
-            component.stiffness = component.stiffness < 1f ? 1f : component.stiffness;
+            EditorGUILayout.PropertyField(constraintIterations, new GUIContent("Constraint Iterations", "How many times per physics step segment lengths and collisions are solved. Higher values stretch less and pass through colliders less, at a higher cost"));
 
             EditorGUILayout.PropertyField(damping, new GUIContent("Rope Dampness", "0 is no damping, 50 is a lot"));
             component.damping = component.damping < 0.01f ? 0.01f : component.damping;
 
             EditorGUILayout.PropertyField(ropeLength, new GUIContent("Rope Length", "How long is the rope, it will hang more or less from starting point to end point depending on this value"));
             component.ropeLength = component.ropeLength < 0.01f ? 0.01f : component.ropeLength;
+
+            EditorGUILayout.Space(2);
+            EditorGUILayout.EndVertical();
+        }
+
+        private void RopeCollision()
+        {
+            EditorGUILayout.Space(10);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.LabelField("ROPE COLLISION", EditorStyles.boldLabel);
+            EditorGUILayout.Space(2);
+
+            EditorGUILayout.PropertyField(belongsTo, new GUIContent("Belongs To", "Unity Physics categories the rope belongs to"));
+            EditorGUILayout.PropertyField(collidesWith, new GUIContent("Collides With", "Unity Physics categories of the colliders the rope collides with"));
 
             EditorGUILayout.Space(2);
             EditorGUILayout.EndVertical();
@@ -159,8 +175,7 @@ namespace GogoGaga.OptimizedRopesAndCables
             EditorGUILayout.LabelField("ROPE CURVE", EditorStyles.boldLabel);
             EditorGUILayout.Space(2);
 
-            EditorGUILayout.PropertyField(midPointPosition, new GUIContent("Midpoint", "Position of the midpoint along the line between start and end points"));
-            EditorGUILayout.PropertyField(midPointWeight, new GUIContent("Midpoint Influence", "Adjust the middle control point weight for the Rational Bezier curve"));
+            EditorGUILayout.PropertyField(midPointPosition, new GUIContent("Midpoint", "Position of the Mid Point transform along the rope"));
 
             EditorGUILayout.Space(2);
             EditorGUILayout.EndVertical();
